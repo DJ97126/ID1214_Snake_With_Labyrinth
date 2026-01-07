@@ -1,98 +1,115 @@
-import argparse
-import os
-import time
+import torch
+import gameEnvironment
+from tqdm import tqdm
+import modules
+import matplotlib.pyplot as plt
+import agentTest
 
-import tensorflow as tf
+class Test():
+    def __init__(self, actor_path, critic_path=None, combined_checkpoint=None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.env = gameEnvironment.game()
+        self.env.fps = 10
+        n_act = self.env.n_act
+        n_obs = self.env.n_obs
+        actor = modules.Actor(n_obs,n_act)
+        critic = modules.Critic(n_obs,n_act)
+        
+        # Load from combined checkpoint or separate files
+        if combined_checkpoint is not None:
+            print(f"Loading combined checkpoint: {combined_checkpoint}")
+            checkpoint = torch.load(combined_checkpoint, map_location=self.device)
+            actor.load_state_dict(checkpoint['actor'])
+            critic.load_state_dict(checkpoint['critic'])
+        else:
+            print(f"Loading separate checkpoints:\n  Actor: {actor_path}\n  Critic: {critic_path}")
+            actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+            critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+        
+        self.agent = agentTest.DQNAgent(
+            actor=actor,
+            critic=critic,
+            n_act=n_act,
+        )
 
-from actorCritic import ActorCritic
-from environment import *
-from utils import get_checkpoint_path
+    def test_episode(self,episodes):
+        total_reward = 0
+        num = 0
+        obs = self.env.reset()
+        # obs = torch.tensor(obs).to(self.device)
+        while True:
+            action = self.agent.predict(obs)
+            next_obs, reward, done, length = self.env.step(action)
+            total_reward += reward
+            obs = torch.tensor(next_obs).to(self.device)
+            obs = next_obs
+            self.env.render(True, episodes+1)
+            num += 1
+            if done: break
+        return total_reward, length, num
 
-env = Environment()
-session = tf.Session()
-agent = ActorCritic(session)
+    def test(self):
+        lengths = []
+        live = []
+        for epoch in tqdm(range(150)):
+            total_reward,length,num = self.test_episode(episodes=epoch)
+            lengths.append(length)
+            live.append(num)
+        # length is used for plotting, recording the length of each round
+        return lengths,live
 
-pygame.init()   # Intializes the pygame
-games_scores = []  # List that will contain the score of each game played by the gamebot
+    # draw pie chart using length list to show the proportion of each length
+    def bucket_data(self,data, interval=10):
+        """Bucket data into intervals."""
+        min_val = min(data)
+        max_val = max(data)
+        buckets = [(i, i + interval) for i in range(min_val, max_val + 1, interval)]
 
+        bucketed_data = {}
+        for start, end in buckets:
+            count = sum(1 for x in data if start <= x < end)
+            label = f"{start}-{end - 1}"
+            bucketed_data[label] = count
 
-parser = argparse.ArgumentParser(description='DQN-snake testing.')
+        return list(bucketed_data.keys()), list(bucketed_data.values())
 
-parser.add_argument('--numberOfGames', type=int, required=False, default=10,
-                    help='Number of test games.')
+    def plot_pie_charts(self, lengths, live):
+        # For lengths data
+        unique_lengths = set(lengths)
+        frequencies_lengths = [lengths.count(val) for val in unique_lengths]
+        avg_length_value = sum(lengths) / len(lengths)
 
-parser.add_argument('--slowDownFactor', type=float, required=False, default=0.06,
-                    help='The factor to make the game slow down. A value of 0 means the games is at full speed.')
+        # For live data
+        live_labels, live_frequencies = self.bucket_data(live)
+        avg_live_value = sum(live) / len(live)
 
-parser.add_argument('--modelName', type=str, required=True,
-                    help='The name of the model.')
+        # Create subplots for the two pie charts
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
+        # Plotting for lengths
+        axes[0].pie(frequencies_lengths, labels=unique_lengths, autopct='%1.1f%%', startangle=140)
+        axes[0].set_title('Proportion of Each Value in "lengths" List')
+        axes[0].text(0, -1.2, 'Average Value: {:.2f}'.format(avg_length_value), ha='center')
 
-def make_agent_play_games(n_games, slow_down_factor):
-    """
-    Make the agent play a given number of games
+        # Plotting for live
+        axes[1].pie(live_frequencies, labels=live_labels, autopct='%1.1f%%', startangle=140)
+        axes[1].set_title('Distribution of "live" List in Intervals of 5')
+        axes[1].text(0, -1.2, 'Average Value: {:.2f}'.format(avg_live_value), ha='center')
 
-    :param n_games: The number of games to play.
-    :param slow_down_factor: Throttling to make the snake move less rapidly.
-    :return: A list containing the score of each game played.
-    """
-    episode = 0
-    iterations_without_progress = 0
-    max_without_progress = 200
-    best_total = 0
+        plt.tight_layout()
+        plt.show()
 
-    with session as sess:
-        agent.saver.restore(sess, checkpoint_path)   # Restore the model
-
-        while episode < n_games:  # Number of games that we want the robot to play
-            time.sleep(slow_down_factor)     # Make the game slow down
-
-            env.render(display=True)
-            observation = env.screenshot()
-            cur_state = env.get_last_frames(observation)
-
-            q_values = agent.predict(cur_state)
-            action = np.argmax(q_values)  # Optimal action
-
-            new_state, reward, done = env.step(action)
-
-            # Check if the snake makes progress in the game
-            if env.snake.total > best_total:
-                best_total = env.snake.total
-                iterations_without_progress = 0
-            else:
-                iterations_without_progress += 1
-            # If the snake gets stuck, the game is over
-            if iterations_without_progress >= max_without_progress:
-                done = True
-
-            if done:   # Game over, start a new game
-                time.sleep(1)
-                games_scores.append(env.snake.total)
-                env.reset()
-                episode += 1  # Increment the number of games played
-                iterations_without_progress = 0
-                best_total = 0
-
-    return games_scores
-
+def run_test(actor_path=None, critic_path=None, combined_checkpoint=None):
+    test = Test(actor_path, critic_path, combined_checkpoint)
+    lengths,live = test.test()
+    test.plot_pie_charts(lengths, live)
+    return lengths, live
 
 if __name__ == '__main__':
-
-    args = parser.parse_args()
-
-    n_games = args.numberOfGames
-    slow_down_factor = args.slowDownFactor
-    model_name = args.modelName
-    checkpoint_path = get_checkpoint_path(model_name=model_name)
-
-    if os.path.isfile(checkpoint_path + ".index"):  # Check to see if the model exists
-        games_scores = make_agent_play_games(n_games, slow_down_factor)
-        mean_score = np.mean(games_scores)
-        std = np.std(games_scores)
-        max_score = np.max(games_scores)
-
-        print("Max score {:.2f}\tMean score {:.2f}\tStandard deviation {:.2f} ".format(max_score, mean_score, std))
-
-    else:
-        raise ValueError('Model file does not exist : a model file is required for testing')
+    # Test fine-tuned model
+    combined_checkpoint = './model_labyrinth/trained_model_95000.pth'
+    run_test(combined_checkpoint=combined_checkpoint)
+    
+    # actor_path = './model3/actor/trained_model_{}.pth'.format((9)*1000)
+    # critic_path = './model3/critic/trained_model_{}.pth'.format((9)*1000)
+    # run_test(actor_path, critic_path)
